@@ -1,0 +1,39 @@
+[2026/01/08 03:58:14] ===============================================
+[2026/01/08 03:58:14] ===== Ventoy2Disk 1.0.99 127.0.0.1:24680 =====
+[2026/01/08 03:58:14] ===============================================
+[2026/01/08 03:58:14] ventoy_disk_enumerate_all
+[2026/01/08 03:58:14] get disk info nvme0n1
+[2026/01/08 03:58:14] is 4k native disk <nvme0n1> <0>
+[2026/01/08 03:58:14] get disk size from sysfs for nvme0n1
+[2026/01/08 03:58:14] /sys/block/nvme0n1/device/vendor not exist 
+[2026/01/08 03:58:14] ventoy_get_vtoy_data /dev/nvme0n1
+[2026/01/08 03:58:14] Invalid efi part2 name <>
+[2026/01/08 03:58:14] disk:</dev/nvme0n1 259:0> model:< SOLIDIGM SSDPFKKW512H7 (nvme)> size:512110190592 (512 GB)
+[2026/01/08 03:58:14] /dev/nvme0n1 NO Ventoy detected
+[2026/01/08 03:58:14] get disk info sdb
+[2026/01/08 03:58:14] is 4k native disk <sdb> <0>
+[2026/01/08 03:58:14] get disk size from sysfs for sdb
+[2026/01/08 03:58:14] ventoy_get_vtoy_data /dev/sdb
+[2026/01/08 03:58:14] NO ventoy efi part layout <32768 0>
+[2026/01/08 03:58:14] disk:</dev/sdb 8:16> model:<ATA ST4000DM004-2U91 (scsi)> size:4000787030016 (4000 GB)
+[2026/01/08 03:58:14] /dev/sdb NO Ventoy detected
+[2026/01/08 03:58:14] get disk info sdc
+[2026/01/08 03:58:14] is 4k native disk <sdc> <0>
+[2026/01/08 03:58:14] get disk size from sysfs for sdc
+[2026/01/08 03:58:14] ventoy_get_vtoy_data /dev/sdc
+[2026/01/08 03:58:14] Not valid ventoy partition layout [2048 60123104] [0 0]
+[2026/01/08 03:58:14] disk:</dev/sdc 8:32> model:< USB  SanDisk 3.2Gen1 (USB)> size:30784094208 (32 GB)
+[2026/01/08 03:58:14] /dev/sdc NO Ventoy detected
+[2026/01/08 03:58:14] get disk info sda
+[2026/01/08 03:58:14] is 4k native disk <sda> <0>
+[2026/01/08 03:58:14] get disk size from sysfs for sda
+[2026/01/08 03:58:14] ventoy_get_vtoy_data /dev/sda
+[2026/01/08 03:58:14] Invalid efi part2 name <>
+[2026/01/08 03:58:14] disk:</dev/sda 8:0> model:<ATA HS-SSD-WAVE(S) 2 (scsi)> size:256060514304 (256 GB)
+[2026/01/08 03:58:14] /dev/sda NO Ventoy detected
+[2026/01/08 03:58:14] ============= DISK DUMP ============
+[2026/01/08 03:58:14] /dev/sdc [32 GB]  USB  SanDisk 3.2Gen1 (USB)	Ventoy: NA
+[2026/01/08 03:58:14] /dev/nvme0n1 [512 GB]  SOLIDIGM SSDPFKKW512H7 (nvme)	Ventoy: NA
+[2026/01/08 03:58:14] /dev/sda [256 GB] ATA HS-SSD-WAVE(S) 2 (scsi)	Ventoy: NA
+[2026/01/08 03:58:14] /dev/sdb [4000 GB] ATA ST4000DM004-2U91 (scsi)	Ventoy: NA
+[2026/01/08 03:59:47] ventoy server exit due to signal ...
