@@ -5,3 +5,38 @@ venv/
 *.tif
 __pycache__/
 .DS_Store
+
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.env
+
+# Data and Backups
+_backup/
+data/
+*.tar.gz
+*.tif
+*.npy
+
+# Model Checkpoints and Results
+checkpoints/
+*.pkl
+*.pth
+*.h5
+submission.csv
+metadata_summary.csv
+
+# Logs
+*.log
+patch_gen_error.log
+download_errors.log
+
+# OS and Editors
+.DS_Store
+.vscode/
+.idea/
