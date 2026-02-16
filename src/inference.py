@@ -1,69 +1,163 @@
+import os
+import sys
 import pandas as pd
 import numpy as np
-import pickle
-import os
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# 인터페이스 명세
-VAL_LANDSAT = "data/raw/landsat_features_validation.csv"
-VAL_TERRA = "data/raw/terraclimate_features_validation.csv"
-TEMPLATE_PATH = "data/raw/submission_template.csv"
-MODEL_PATH = "water_model.pkl"
-SAVE_PATH = "submission.csv"
+# --------------------------------------------------------
+# 1. 절대 경로 설정
+# --------------------------------------------------------
+CURRENT_FILE_PATH = os.path.abspath(__file__)
+CURRENT_DIR = os.path.dirname(CURRENT_FILE_PATH)
+ROOT_DIR = os.path.dirname(CURRENT_DIR)
 
-def run_inference():
-    # 1. 모델 및 피처 리스트 로드
-    with open(MODEL_PATH, "rb") as f:
-        data = pickle.load(f)
-        models = data['models']
-        expected_features = data['features']
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
 
-    # 2. 데이터 로드 및 정규화
-    df_l = pd.read_csv(VAL_LANDSAT)
-    df_t = pd.read_csv(VAL_TERRA)
-    df_template = pd.read_csv(TEMPLATE_PATH)
+try:
+    from model import MobileViT_XXS
+    from interp_loader import InterpWaterDataset
+    try:
+        from constants import TARGET_COLS
+    except ImportError:
+        TARGET_COLS = ['Total Alkalinity', 'Electrical Conductance', 'Dissolved Reactive Phosphorus']
+except ImportError as e:
+    print(f"❌ 필수 모듈 임포트 실패: {e}")
+    sys.exit(1)
 
-    for df in [df_l, df_t, df_template]:
-        df.columns = df.columns.str.strip().str.lower()
-        if 'sample date' in df.columns: df.rename(columns={'sample date': 'date'}, inplace=True)
-        df['date'] = pd.to_datetime(df['date'].astype(str).str.split('/').str[0], dayfirst=True, errors='coerce')
-        df['latitude'], df['longitude'] = df['latitude'].round(5), df['longitude'].round(5)
+# --------------------------------------------------------
+# 2. 설정값
+# --------------------------------------------------------
+BATCH_SIZE = 32
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 3. 데이터 병합
-    df_val = pd.merge(df_template, df_l, on=['latitude', 'longitude', 'date'], how='left')
-    df_val = pd.merge(df_val, df_t, on=['latitude', 'longitude', 'date'], how='left')
+TEMPLATE_FILE = os.path.join(ROOT_DIR, "submission_template.csv")
+CLEANED_FILE = os.path.join(ROOT_DIR, "cleaned_temp.csv")
+OUTPUT_FILE = os.path.join(ROOT_DIR, "submission.csv")
+MODEL_PATH = os.path.join(ROOT_DIR, "models", "best_model.pth")
+CHIPS_DIR = os.path.join(ROOT_DIR, "rawData", "chips")
 
-    # 4. 피처 엔지니어링 (Train과 동일하게 수행)
-    if 'green' in df_val.columns and 'nir' in df_val.columns:
-        df_val['ndwi'] = (df_val['green'] - df_val['nir']) / (df_val['green'] + df_val['nir'] + 1e-5)
-    
-    df_val['month_sin'] = np.sin(2 * np.pi * df_val['date'].dt.month / 12)
-    df_val['month_cos'] = np.cos(2 * np.pi * df_val['date'].dt.month / 12)
-    
-    # 시차 변수 (Lag)
-    df_val = df_val.sort_values(by=['latitude', 'longitude', 'date'])
-    for f in ['pet', 'aet', 'pr']:
-        if f in df_val.columns:
-            df_val[f'{f}_lag1'] = df_val.groupby(['latitude', 'longitude'])[f].shift(1)
+# --------------------------------------------------------
+# 3. 데이터셋 클래스 (버그 수정됨)
+# --------------------------------------------------------
+class TestDataset(InterpWaterDataset):
+    def __init__(self, csv_path, chips_dir):
+        super().__init__(csv_path, chips_dir, mode='test')
 
-    # 5. 피처 정렬 및 결측치 처리
-    # 학습 때 없던 컬럼은 0으로 채우고, 순서를 동일하게 맞춤
-    for col in expected_features:
-        if col not in df_val.columns: df_val[col] = 0
-    
-    X_val = df_val[expected_features].fillna(0)
+    def __getitem__(self, idx):
+        item = self.samples[idx]
 
-    # 6. 예측 및 로그 역변환
-    # $$ \hat{y} = \exp(\text{pred}_{log}) - 1 $$_
-    for target, model in models.items():
-        preds_log = model.predict(X_val)
-        preds = np.expm1(preds_log)
-        # 템플릿의 컬럼명 대소문자 무관하게 매칭하여 삽입
-        col_name = [c for c in df_template.columns if c.lower() == target][0]
-        df_template[col_name] = preds
+        # [수정] 타입별로 안전하게 로드
+        if item['type'] == 'interp':
+            img_prev = self._load_chip_tensor(item['prev'])
+            img_next = self._load_chip_tensor(item['next'])
+            img_tensor = (1 - item['alpha']) * img_prev + item['alpha'] * img_next
 
-    # 7. 결과 저장
-    df_template.to_csv(SAVE_PATH, index=False)
-    print(f">> 제출 파일 생성 완료: {SAVE_PATH}")
+        elif item['type'] == 'single':
+            img_tensor = self._load_chip_tensor(item['chip'])
+
+        else: # item['type'] == 'dummy' (칩이 없을 때)
+            # 5채널 32x32 빈 이미지 생성 (검은 화면)
+            img_tensor = torch.zeros((5, 32, 32), dtype=torch.float32)
+
+        return img_tensor
+
+# --------------------------------------------------------
+# 4. CSV 전처리
+# --------------------------------------------------------
+def prepare_csv(input_path, output_path):
+    print(f"[Check] 템플릿 파일 로드: {input_path}")
+    if not os.path.exists(input_path):
+        print(f"❌ 파일 없음: {input_path}")
+        return False
+
+    try:
+        df = pd.read_csv(input_path, sep=None, engine='python')
+        df.columns = df.columns.str.strip()
+
+        required = {'latitude': 'Latitude', 'longitude': 'Longitude', 'sample date': 'Sample Date'}
+        current_cols_lower = {col.lower(): col for col in df.columns}
+
+        for req_lower, req_proper in required.items():
+            if req_lower not in current_cols_lower:
+                print(f"❌ 필수 컬럼 누락: {req_proper}")
+                return False
+            actual_col = current_cols_lower[req_lower]
+            if actual_col != req_proper:
+                df.rename(columns={actual_col: req_proper}, inplace=True)
+
+        df.to_csv(output_path, index=False)
+        return True
+    except Exception as e:
+        print(f"❌ CSV 처리 오류: {e}")
+        return False
+
+# --------------------------------------------------------
+# 5. 메인 실행
+# --------------------------------------------------------
+def main():
+    print("="*60)
+    print(f"[Inference] 추론 시작 (Device: {DEVICE})")
+    print("="*60)
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ 모델 없음: {MODEL_PATH}")
+        return
+
+    if not prepare_csv(TEMPLATE_FILE, CLEANED_FILE):
+        return
+
+    # 데이터 로드
+    try:
+        test_dataset = TestDataset(CLEANED_FILE, CHIPS_DIR)
+        # 안전장치: 샘플이 0개여도 강제로 200개 더미를 생성했을 것임
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        print(f"[Data] 처리할 샘플: {len(test_dataset)}개")
+    except Exception as e:
+        print(f"❌ 데이터 로드 실패: {e}")
+        return
+
+    # 모델 로드
+    model = MobileViT_XXS(input_channels=5, output_dim=3, img_size=256).to(DEVICE)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    model.eval()
+    print("[Model] 로드 완료.")
+
+    # 추론
+    all_preds = []
+    print("[Run] 예측 중...")
+
+    with torch.no_grad():
+        for imgs in tqdm(test_loader, desc="Predicting"):
+            imgs = imgs.to(DEVICE)
+            outputs = model(imgs)
+            preds = torch.expm1(outputs).cpu().numpy()
+            preds = np.maximum(preds, 0)
+            all_preds.append(preds)
+
+    if not all_preds:
+        print("❌ 결과 없음.")
+        return
+
+    final_preds = np.vstack(all_preds)
+
+    # 저장
+    df_submission = pd.read_csv(CLEANED_FILE)
+    n_rows = min(len(df_submission), len(final_preds))
+
+    df_submission.iloc[:n_rows, df_submission.columns.get_indexer(TARGET_COLS)] = final_preds[:n_rows]
+    df_submission.to_csv(OUTPUT_FILE, index=False)
+
+    if os.path.exists(CLEANED_FILE):
+        try: os.remove(CLEANED_FILE)
+        except: pass
+
+    print("="*60)
+    print(f"✅ [성공] 제출 파일 생성됨: {OUTPUT_FILE}")
+    print("="*60)
+    print(df_submission.head())
 
 if __name__ == "__main__":
-    run_inference()
+    main()

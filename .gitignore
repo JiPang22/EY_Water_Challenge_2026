@@ -40,3 +40,32 @@ download_errors.log
 .DS_Store
 .vscode/
 .idea/
+# --- [Data & Chips] ---
+# 용량이 크고 대회 보안 정책상 올라가면 안 되는 데이터들
+rawData/
+*.tif
+*.csv
+# 우리가 생성한 임시 및 결과 파일
+cleaned_temp.csv
+cleaned_submission.csv
+submission.csv
+final_submission.csv
+
+# --- [Models] ---
+# 학습된 가중치 파일 (용량이 크고 보안상 제외)
+models/
+*.pth
+*.onnx
+
+# --- [Python Environment] ---
+# 가상환경 및 라이브러리
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+
+# --- [IDE & OS] ---
+.vscode/
+.idea/
+.DS_Store

@@ -1,65 +1,148 @@
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
-import pickle
+import os
 import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-# 인터페이스 명세
-INPUT_PATH = "data/processed/train_merged.csv"
-MODEL_PATH = "water_model.pkl"
-TARGET_COLS = ['total alkalinity', 'electrical conductance', 'dissolved reactive phosphorus']
-# 학습에 방해되는 정보(날짜, 좌표, ID)는 제외
-DROP_COLS = ['date', 'latitude', 'longitude', 'id']
+# 커스텀 모듈 임포트
+from interp_loader import InterpWaterDataset
+from model import MobileViT_XXS
+from constants import TARGET_COLS
 
-def train():
-    df = pd.read_csv(INPUT_PATH)
-    
-    # 1. 데이터 분리
-    # 타겟값과 그와 관련된 로그값들을 모두 제거하여 순수 피처(X)만 남김
-    leakage_cols = [c for c in df.columns if c.endswith('_log')]
-    X = df.drop(columns=TARGET_COLS + DROP_COLS + leakage_cols, errors='ignore')
-    y = df[TARGET_COLS]
-    
-    # 공부용 80%, 시험용 20% 분할
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    models = {}
-    print(f">> 학습 시작. 피처 수: {X.shape[1]}")
+# --------------------------------------------------------
+# 1. 하이퍼파라미터 설정
+# --------------------------------------------------------
+BATCH_SIZE = 32
+LR = 1e-3        # 0.001 (초기 학습률)
+EPOCHS = 50      # 총 학습 횟수
+VAL_SPLIT = 0.2  # 검증 데이터 비율 (20%)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SAVE_DIR = "../models"
+
+def main():
+    # 모델 저장 폴더 생성
+    os.makedirs(SAVE_DIR, exist_ok=True)
+
+    # --------------------------------------------------------
+    # 2. 데이터셋 준비
+    # --------------------------------------------------------
+    print(f"[Init] 데이터셋 준비 중...")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(base_dir)
+    csv_path = os.path.join(root_dir, 'rawData', 'water_quality_training_dataset.csv')
+    chips_dir = os.path.join(root_dir, 'rawData', 'chips')
+
+    # 전체 데이터 로드
+    full_dataset = InterpWaterDataset(csv_path, chips_dir)
+
+    # Train / Validation 분할
+    val_size = int(len(full_dataset) * VAL_SPLIT)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    # 데이터 로더 (num_workers는 CPU 코어 수에 따라 조절, 에러 시 0으로 변경)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+    print(f"[Init] 데이터 분할 완료: Train({train_size}) / Val({val_size})")
+
+    # --------------------------------------------------------
+    # 3. 모델 및 학습 도구 설정
+    # --------------------------------------------------------
+    # img_size=256 설정 (모델 내부 리사이즈와 일치)
+    model = MobileViT_XXS(input_channels=5, output_dim=3, img_size=256).to(DEVICE)
+
+    # Optimizer & Loss
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    criterion = nn.MSELoss() # 회귀 문제 (평균 제곱 오차)
+
+    # Learning Rate Scheduler (학습률을 서서히 줄임)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+    # --------------------------------------------------------
+    # 4. 학습 루프 (Training Loop)
+    # --------------------------------------------------------
+    best_loss = float('inf')
     start_time = time.time()
 
-    for i, target in enumerate(TARGET_COLS):
-        # 수치 안정성을 위해 로그 변환 적용
-        # $$ y_{log} = \ln(y + 1) $$_
-        y_tr_log = np.log1p(np.maximum(y_train[target], 0))
-        y_va_log = np.log1p(np.maximum(y_val[target], 0))
-        
-        # 모델 설정 (최적화된 파라미터 반영)
-        model = xgb.XGBRegressor(
-            n_estimators=1000,
-            learning_rate=0.05,
-            max_depth=6,
-            n_jobs=-1, # R5 5600 모든 코어 사용
-            random_state=42,
-            early_stopping_rounds=50
-        )
-        
-        # 학습
-        model.fit(X_train, y_tr_log, eval_set=[(X_val, y_va_log)], verbose=False)
-        
-        # 평가 (로그를 다시 원래 숫자로 복구)
-        preds = np.expm1(model.predict(X_val))
-        r2 = r2_score(y_val[target], preds)
-        
-        models[target] = model
-        print(f"[{target}] R2 Score: {r2:.4f}")
+    print(f"\n[Train] 학습 시작 (Device: {DEVICE}, Epochs: {EPOCHS})")
+    print("=" * 60)
 
-    # 결과 저장
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump({'models': models, 'features': X.columns.tolist()}, f)
-    
-    print(f">> 완료. 소요 시간: {time.time() - start_time:.2f}s")
+    for epoch in range(EPOCHS):
+        # --- Train Mode ---
+        model.train()
+        train_loss = 0.0
+
+        # 진행률 표시 (tqdm)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="batch")
+        for imgs, targets in pbar:
+            imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
+
+            optimizer.zero_grad()      # 기울기 초기화
+            outputs = model(imgs)      # 예측
+            loss = criterion(outputs, targets) # 오차 계산
+            loss.backward()            # 역전파
+            optimizer.step()           # 가중치 갱신
+
+            train_loss += loss.item()
+            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+        avg_train_loss = train_loss / len(train_loader)
+
+        # --- Validation Mode ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for imgs, targets in val_loader:
+                imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
+                outputs = model(imgs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        # 스케줄러 업데이트
+        scheduler.step()
+
+        # --- 결과 기록 및 저장 ---
+        elapsed = time.time() - start_time
+        avg_time_per_epoch = elapsed / (epoch + 1)
+        remaining_time = avg_time_per_epoch * (EPOCHS - epoch - 1)
+
+        log_msg = (f"Epoch {epoch+1:02d} | "
+                   f"Train Loss: {avg_train_loss:.4f} | "
+                   f"Val Loss: {avg_val_loss:.4f} | "
+                   f"ETA: {remaining_time/60:.1f}m")
+
+        # Best Model 저장
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            save_path = os.path.join(SAVE_DIR, "best_model.pth")
+            torch.save(model.state_dict(), save_path)
+            log_msg += " [Saved ★]"
+
+        print(log_msg)
+
+    total_time = time.time() - start_time
+    print("=" * 60)
+    print(f"[Done] 학습 완료. 총 소요 시간: {total_time/60:.1f}분")
+    print(f"[Result] 최종 Best Val Loss: {best_loss:.4f}")
+    print(f"[Path] 모델 저장 위치: {os.path.abspath(SAVE_DIR)}")
 
 if __name__ == "__main__":
-    train()
+    # 실행 전 GPU 메모리 정리
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # 단위 테스트: 간단한 Forward 실행
+    try:
+        print("[UnitTest] 사전 점검 중...")
+        test_model = MobileViT_XXS(5, 3, 256).to(DEVICE)
+        test_in = torch.randn(2, 5, 32, 32).to(DEVICE)
+        _ = test_model(test_in)
+        print("[UnitTest] 통과. 학습을 시작합니다.")
+        main()
+    except Exception as e:
+        print(f"[Error] 유닛 테스트 실패: {e}")
