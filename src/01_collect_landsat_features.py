@@ -23,18 +23,22 @@ import warnings
 # 경고 무시
 warnings.filterwarnings("ignore")
 
-# ⚙️ 설정
+# ⚙️ 설정 (명령행 인자로 덮어쓰기 가능)
 TEMPLATE_PATH = "submission_template.csv"
 OUTPUT_PATH = "landsat_features_test.csv"
 
-# 🚨 실패 시 채워넣을 '빈 사전' 정의 (형태 통일)
+# 학습용: rawData/water_quality_training_dataset.csv → landsat_features_training.csv
+
+# 데이터가 전혀 없을 때만 사용 (형태 통일)
+# cloud_cover 포함: 구름 정보도 데이터로 취급
 NAN_RESULT = {
-    'nir': np.nan,
-    'green': np.nan,
-    'swir16': np.nan,
-    'swir22': np.nan,
-    'NDMI': np.nan,
-    'MNDWI': np.nan,
+    "nir": np.nan,
+    "green": np.nan,
+    "swir16": np.nan,
+    "swir22": np.nan,
+    "NDMI": np.nan,
+    "MNDWI": np.nan,
+    "cloud_cover": np.nan,
 }
 
 
@@ -55,14 +59,22 @@ def main():
     """
     print("🚀 Starting Robust Landsat Extraction (Step 01)...")
 
-    # 1. 템플릿 CSV 로드 (일반적으로 submission_template.csv)
-    if os.path.exists(TEMPLATE_PATH):
-        df = pd.read_csv(TEMPLATE_PATH)
-    elif os.path.exists(f"../{TEMPLATE_PATH}"):
-        df = pd.read_csv(f"../{TEMPLATE_PATH}")
-    else:
-        print("❌ Template not found")
+    # 1. 템플릿 CSV 로드
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        TEMPLATE_PATH,
+        os.path.join(base, TEMPLATE_PATH),
+        os.path.join(os.getcwd(), TEMPLATE_PATH),
+    ]
+    found = None
+    for p in candidates:
+        if os.path.exists(p):
+            found = p
+            break
+    if not found:
+        print(f"❌ Template not found. Tried: {candidates}")
         return
+    df = pd.read_csv(found)
 
     results = []
     catalog = get_catalog()
@@ -78,42 +90,48 @@ def main():
             lon = row["Longitude"]
             date = pd.to_datetime(row["Sample Date"], dayfirst=True)
 
-            # 날짜 범위: 관측일 ± 15일
-            start_date = (date - pd.Timedelta(days=15)).strftime("%Y-%m-%d")
-            end_date = (date + pd.Timedelta(days=15)).strftime("%Y-%m-%d")
-            time_range = f"{start_date}/{end_date}"
-
             # 작은 박스(bbox) 정의
             bbox = [lon - 0.001, lat - 0.001, lon + 0.001, lat + 0.001]
 
-            # 2-1. STAC API로 Landsat 장면 검색
-            search = catalog.search(
-                collections=["landsat-c2-l2"],
-                bbox=bbox,
-                datetime=time_range,
-                query={"eo:cloud_cover": {"lt": 30}},
-            )
-            items = search.item_collection()
+            # 2-1. STAC API로 Landsat 장면 검색 (구름 제한 없음 - 모든 장면 수집)
+            # 구름이 많은 장면도 데이터: cloud_cover를 피처로 저장
+            items = []
+            for days in [15, 30, 60, 90]:
+                start_date = (date - pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+                end_date = (date + pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+                time_range = f"{start_date}/{end_date}"
+                search = catalog.search(
+                    collections=["landsat-c2-l2"],
+                    bbox=bbox,
+                    datetime=time_range,
+                )
+                items = list(search.item_collection())
+                if len(items) > 0:
+                    break
 
             if len(items) == 0:
-                # 적절한 장면을 찾지 못하면, 미리 정의한 NaN 결과 사용
+                # 날짜 범위를 넓혀도 장면이 없을 때만 NaN (버리지 않고 기록)
                 results.append(NAN_RESULT)
                 fail_cnt += 1
                 continue
 
-            # 2-2. 가장 구름이 적은 장면 1개 선택 및 서명
-            best_item = min(items, key=lambda item: item.properties["eo:cloud_cover"])
+            # 2-2. 가장 구름이 적은 장면 1개 선택 (구름 많은 것도 사용 가능)
+            best_item = min(items, key=lambda item: item.properties.get("eo:cloud_cover", 100))
             signed_item = planetary_computer.sign(best_item)
+            cloud_cover = float(best_item.properties.get("eo:cloud_cover", np.nan))
 
             # 2-3. 선택된 장면에서 원하는 밴드를 xarray로 로드
-            ds = odc.stac.load(
-                [signed_item],
-                bands=["nir08", "red", "green", "swir16", "swir22"],
-                bbox=bbox,
-                resolution=30,
-            )
+            try:
+                ds = odc.stac.load(
+                    [signed_item],
+                    bands=["nir08", "red", "green", "swir16", "swir22"],
+                    bbox=bbox,
+                    resolution=30,
+                )
+            except Exception:
+                ds = None
 
-            if ds.sizes["time"] > 0:
+            if ds is not None and ds.sizes["time"] > 0:
                 # 공간 차원(x, y)에 대한 중앙값 추출
                 data = ds.isel(time=0).median(dim=["x", "y"])
 
@@ -134,13 +152,24 @@ def main():
                         "swir22": swir22,
                         "NDMI": ndmi,
                         "MNDWI": mndwi,
+                        "cloud_cover": cloud_cover,
                     }
                 )
                 success_cnt += 1
             else:
-                # 시간 축에 데이터가 없을 때도 NaN 결과 사용
-                results.append(NAN_RESULT)
-                fail_cnt += 1
+                # 밴드 로드 실패해도 cloud_cover는 저장 (버리지 않음)
+                results.append(
+                    {
+                        "nir": np.nan,
+                        "green": np.nan,
+                        "swir16": np.nan,
+                        "swir22": np.nan,
+                        "NDMI": np.nan,
+                        "MNDWI": np.nan,
+                        "cloud_cover": cloud_cover,
+                    }
+                )
+                success_cnt += 1
 
         except Exception as e:
             # 어떤 에러가 나도 NaN 결과를 넣고 계속 진행
@@ -158,11 +187,29 @@ def main():
     # 결측치 평균값으로 채우기 (모델 입력용)
     final_df = final_df.fillna(final_df.mean(numeric_only=True))
 
-    final_df.to_csv(OUTPUT_PATH, index=False)
-    print(f"\n✅ Final Extraction Done! Saved to {OUTPUT_PATH}")
+    out_path = OUTPUT_PATH if os.path.isabs(OUTPUT_PATH) else os.path.join(base, OUTPUT_PATH)
+    final_df.to_csv(out_path, index=False)
+    print(f"\n✅ Final Extraction Done! Saved to {out_path}")
     print(f"📊 Stats: Success={success_cnt}, Fails={fail_cnt}")
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Landsat 피처 수집 (구름 제한 없음)")
+    parser.add_argument("--train", action="store_true", help="학습용: water_quality_training_dataset.csv → landsat_features_training.csv")
+    parser.add_argument("--template", type=str, help="입력 CSV 경로")
+    parser.add_argument("--output", type=str, help="출력 CSV 경로")
+    args = parser.parse_args()
+
+    if args.train:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        TEMPLATE_PATH = os.path.join(base, "rawData", "water_quality_training_dataset.csv")
+        OUTPUT_PATH = os.path.join(base, "landsat_features_training.csv")
+        print(f"📂 [학습용] 입력: {TEMPLATE_PATH}\n   출력: {OUTPUT_PATH}")
+    if args.template:
+        TEMPLATE_PATH = args.template
+    if args.output:
+        OUTPUT_PATH = args.output
+
     main()
 

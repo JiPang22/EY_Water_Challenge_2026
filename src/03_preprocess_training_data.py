@@ -24,24 +24,17 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-# 스케일링 대상 피처 (Landsat/TerraClimate 7개)
+# 스케일링 대상 피처 (Landsat/TerraClimate, cloud_cover는 Landsat CSV에 있으면 포함)
 SCALER_FEATURE_COLS = [
-    "nir",
-    "green",
-    "swir16",
-    "swir22",
-    "NDMI",
-    "MNDWI",
-    "pet",
+    "nir", "green", "swir16", "swir22", "NDMI", "MNDWI", "pet"
 ]
-
 
 def build_and_save_tabular_scaler(
     root_dir: str,
     train_csv_name: str = "water_quality_training_dataset.csv",
     landsat_csv_name: str = "landsat_features_training.csv",
     terra_csv_name: str = "terraclimate_features_training.csv",
-    scaler_output_name: str = "scaler_tabular.pkl",
+    scaler_output_name: str = "models/scaler_tabular.pkl",
 ) -> None:
     """
     학습 데이터 기반으로 StandardScaler를 학습하고,
@@ -66,26 +59,70 @@ def build_and_save_tabular_scaler(
     terra_df.columns = terra_df.columns.str.strip()
 
     merge_keys = ["Latitude", "Longitude", "Sample Date"]
-    landsat_cols = merge_keys + [
-        "nir",
-        "green",
-        "swir16",
-        "swir22",
-        "NDMI",
-        "MNDWI",
-    ]
+    # Landsat columns needed: nir, green, swir16, swir22, NDMI, MNDWI
+    landsat_cols = merge_keys + ["nir", "green", "swir16", "swir22", "NDMI", "MNDWI"]
+
+    # 병합 전 디버깅: 날짜 포맷 통일 및 위도/경도 반올림
+    print(f"\n🔍 [Debug] Before merge:")
+    print(f"  Train rows: {len(train_df)}")
+    print(f"  Landsat rows: {len(landsat_df)}")
+    print(f"  Terra rows: {len(terra_df)}")
+    
+    # 위도/경도 반올림 (소수점 6자리로 통일) - 먼저 처리
+    for df_temp in [train_df, landsat_df, terra_df]:
+        df_temp["Latitude"] = pd.to_numeric(df_temp["Latitude"], errors="coerce").round(6)
+        df_temp["Longitude"] = pd.to_numeric(df_temp["Longitude"], errors="coerce").round(6)
+    
+    # 날짜를 datetime으로 변환 후 다시 문자열로 (포맷 통일)
+    # 실패한 날짜는 원본 문자열 유지
+    for df_temp in [train_df, landsat_df, terra_df]:
+        dates_parsed = pd.to_datetime(df_temp["Sample Date"], dayfirst=True, errors="coerce")
+        df_temp["Sample Date"] = dates_parsed.dt.strftime("%d-%m-%Y").fillna(df_temp["Sample Date"])
+    
+    # 병합 키를 문자열로 변환 (정확한 매칭을 위해)
+    for df_temp in [train_df, landsat_df, terra_df]:
+        df_temp["Latitude"] = df_temp["Latitude"].astype(str)
+        df_temp["Longitude"] = df_temp["Longitude"].astype(str)
+        df_temp["Sample Date"] = df_temp["Sample Date"].astype(str)
+
+    # 병합 전 공통 키 확인
+    train_keys = set(zip(train_df["Latitude"], train_df["Longitude"], train_df["Sample Date"]))
+    landsat_keys = set(zip(landsat_df["Latitude"], landsat_df["Longitude"], landsat_df["Sample Date"]))
+    terra_keys = set(zip(terra_df["Latitude"], terra_df["Longitude"], terra_df["Sample Date"]))
+    
+    common_train_landsat = len(train_keys & landsat_keys)
+    common_train_terra = len(train_keys & terra_keys)
+    
+    print(f"  Common keys (Train & Landsat): {common_train_landsat} / {len(train_keys)}")
+    print(f"  Common keys (Train & Terra): {common_train_terra} / {len(train_keys)}")
 
     df = pd.merge(train_df, landsat_df[landsat_cols], on=merge_keys, how="left")
+    matched_landsat = df['nir'].notna().sum()
+    print(f"  After Landsat merge: {len(df)} rows, matched: {matched_landsat}")
+    
     df = pd.merge(df, terra_df[merge_keys + ["pet"]], on=merge_keys, how="left")
+    matched_terra = df['pet'].notna().sum()
+    print(f"  After Terra merge: {len(df)} rows, matched: {matched_terra}")
+    
+    if matched_landsat == 0:
+        print("\n⚠️ Landsat 병합 실패! 첫 3행 키 비교:")
+        print("Train:", train_df[merge_keys].head(3).values.tolist())
+        print("Landsat:", landsat_df[merge_keys].head(3).values.tolist())
 
-    # 스케일링 대상 칼럼 확인
     missing = [c for c in SCALER_FEATURE_COLS if c not in df.columns]
     if missing:
         raise ValueError(
             f"Required scaler features not found in merged training data: {missing}"
         )
 
-    X_train = df[SCALER_FEATURE_COLS].astype(np.float32).values
+    # NaN이 있는 행은 제외하고 스케일러 학습
+    df_valid = df[SCALER_FEATURE_COLS].dropna()
+    print(f"\n⚠️ Valid rows for scaler (non-NaN): {len(df_valid)} / {len(df)}")
+    
+    if len(df_valid) == 0:
+        raise ValueError("❌ No valid rows found after merge! Check merge keys.")
+    
+    X_train = df_valid[SCALER_FEATURE_COLS].astype(np.float32).values
 
     scaler = StandardScaler()
     scaler.fit(X_train)
@@ -101,6 +138,8 @@ def build_and_save_tabular_scaler(
 
     # 스케일러를 루트 디렉터리에 저장
     scaler_path = os.path.join(root_dir, scaler_output_name)
+    os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
+
     with open(scaler_path, "wb") as f:
         pickle.dump(scaler, f)
 
@@ -115,4 +154,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
