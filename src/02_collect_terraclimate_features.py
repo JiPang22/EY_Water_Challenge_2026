@@ -41,11 +41,25 @@ def get_fresh_ds():
         modifier=planetary_computer.sign_inplace,
     )
     collection = catalog.get_collection("terraclimate")
-    asset = collection.assets["zarr-https"]
+    # 'zarr-https' 대신 Azure Blob File System용 'zarr-abfs' 사용이 더 안정적입니다.
+    asset = collection.assets["zarr-abfs"]
 
-    # asset.href 안에 이미 인증 토큰이 포함되어 있으며,
-    # xarray가 이를 인식해서 zarr 데이터를 불러옵니다.
-    ds = xr.open_dataset(asset.href, engine="zarr")
+    # [오류 수정] planetary-computer 라이브러리 최신 버전 대응 로직
+    # asset의 extra_fields에 포함된 storage_options를 명시적으로 사용합니다.
+    # 과거에는 planetary_computer.storage_options() 함수가 있었지만, 현재는 이 방식이 표준입니다.
+    if "xarray:storage_options" in asset.extra_fields:
+        storage_options = asset.extra_fields["xarray:storage_options"]
+        # open_zarr는 zarr 데이터셋에 더 최적화된 함수입니다.
+        ds = xr.open_zarr(
+            asset.href,
+            storage_options=storage_options,
+            consolidated=True,
+        )
+    else:
+        # 예전 방식 또는 다른 형식의 asset을 위한 예외 처리
+        ds = xr.open_dataset(
+            asset.href, **asset.extra_fields.get("xarray:open_kwargs", {})
+        )
     return ds
 
 
@@ -77,6 +91,7 @@ def main():
 
     # 1. 각 월(period)에 대해 반복
     for period in tqdm(unique_dates):
+        ds = None  # 루프 시작 시 ds를 None으로 초기화
         try:
             # 매번 새로운 Dataset을 열어 인증 문제를 회피
             ds = get_fresh_ds()
@@ -116,6 +131,10 @@ def main():
             if error_count == 1:
                 print(f"\n⚠️ First Error at {period}: {e}")
             continue
+        finally:
+            # 성공/실패 여부와 관계없이 데이터셋 리소스를 항상 정리합니다.
+            if ds is not None:
+                ds.close()
 
     # 2. 결과를 원본 템플릿과 병합하거나, 완전히 실패했을 경우 대체값 사용
     if len(results) == 0:
@@ -146,4 +165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

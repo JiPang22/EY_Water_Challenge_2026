@@ -184,8 +184,9 @@ def main():
     feat_df = pd.DataFrame(results)
     final_df = pd.concat([df, feat_df], axis=1)
 
-    # 결측치 평균값으로 채우기 (모델 입력용)
-    final_df = final_df.fillna(final_df.mean(numeric_only=True))
+    # [Data Engineering Tip] 결측치(NaN)는 수집 단계에서 채우지 않고 그대로 두는 것이 좋습니다.
+    # 추후 전처리 단계에서 학습 데이터의 통계값(mean/median)을 사용하여 일관되게 채울 수 있습니다.
+    # final_df = final_df.fillna(final_df.mean(numeric_only=True))
 
     out_path = OUTPUT_PATH if os.path.isabs(OUTPUT_PATH) else os.path.join(base, OUTPUT_PATH)
     final_df.to_csv(out_path, index=False)
@@ -212,4 +213,3 @@ if __name__ == "__main__":
         OUTPUT_PATH = args.output
 
     main()
-
